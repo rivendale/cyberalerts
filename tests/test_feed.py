@@ -14,6 +14,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 FIX = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -228,6 +230,118 @@ class TestTopics(unittest.TestCase):
         self.assertIn("ai-agents", bf.detect_topics("prompt injection against an LLM agent"))
         self.assertIn("supply-chain", bf.detect_topics("malicious npm package typosquat", ["npm"]))
         self.assertIn("node-python", bf.detect_topics("x", ["pip"]))
+
+
+
+class TestTelegramParser(unittest.TestCase):
+    def test_nested_bubble_preserves_link_and_date(self):
+        html_doc = """
+        <div class="tgme_widget_message js-widget_message" data-post="IntCyberDigest/99">
+          <div class="tgme_widget_message_bubble">
+            <div class="tgme_widget_message_text js-message_text">Nested bubble CVE-2026-7777 supply-chain note</div>
+            <a class="tgme_widget_message_date" href="https://t.me/IntCyberDigest/99">
+              <time datetime="2026-11-01T15:30:00+00:00">15:30</time>
+            </a>
+          </div>
+        </div>
+        <div class="tgme_widget_message js-widget_message" data-post="IntCyberDigest/100">
+          <div class="tgme_widget_message_bubble">
+            <div class="tgme_widget_message_text js-message_text">Second post about npm typosquat</div>
+            <a class="tgme_widget_message_date" href="https://t.me/IntCyberDigest/100">
+              <time datetime="2026-11-02T09:00:00+00:00">09:00</time>
+            </a>
+          </div>
+        </div>
+        """
+        parser = bf.TelegramHTMLParser()
+        parser.feed(html_doc)
+        self.assertEqual(len(parser.messages), 2)
+        self.assertEqual(parser.messages[0]["link"], "https://t.me/IntCyberDigest/99")
+        self.assertEqual(parser.messages[0]["date"], "2026-11-01T15:30:00+00:00")
+        self.assertIn("CVE-2026-7777", parser.messages[0]["text"])
+        self.assertEqual(parser.messages[1]["link"], "https://t.me/IntCyberDigest/100")
+        self.assertEqual(parser.messages[1]["date"], "2026-11-02T09:00:00+00:00")
+
+
+class TestCrossIdCollapse(unittest.TestCase):
+    def test_ghsa_only_news_merges_into_cve_preferred_advisory(self):
+        advisory = bf.empty_item()
+        advisory.update(
+            {
+                "id": "CVE-2026-5555",
+                "cves": ["CVE-2026-5555"],
+                "ghsa_ids": ["GHSA-zzzz-yyyy-xxxx"],
+                "title": "Advisory",
+                "sources": ["GitHub Advisory"],
+                "links": ["https://github.com/advisories/GHSA-zzzz-yyyy-xxxx"],
+                "severity": "high",
+                "summary": "GitHub advisory",
+            }
+        )
+        news = bf.empty_item()
+        news.update(
+            {
+                "id": "GHSA-zzzz-yyyy-xxxx",
+                "ghsa_ids": ["GHSA-zzzz-yyyy-xxxx"],
+                "title": "News only knows the GHSA",
+                "sources": ["The Hacker News"],
+                "links": ["https://example.com/news/ghsa"],
+                "severity": "critical",
+                "summary": "Security news",
+                "unconfirmed": True,
+            }
+        )
+        out = bf.collapse_news_into_cves([advisory, news])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["cves"], ["CVE-2026-5555"])
+        self.assertIn("GHSA-zzzz-yyyy-xxxx", out[0]["ghsa_ids"])
+        self.assertIn("The Hacker News", out[0]["sources"])
+        self.assertEqual(out[0]["severity"], "critical")
+        self.assertFalse(out[0]["unconfirmed"])
+
+
+class TestEmptyFeedGuard(unittest.TestCase):
+    def test_all_failed_empty_exits_nonzero(self):
+        # Simulate main's guard logic via a tiny driver: monkeypatch collectors.
+        import build_feed as mod
+
+        def boom(*_a, **_k):
+            return [], "boom failed: offline"
+
+        def boom_rss(*_a, **_k):
+            return [], ["RSS BleepingComputer failed: offline"]
+
+        orig = (
+            mod.collect_kev,
+            mod.collect_ghsa,
+            mod.collect_nvd,
+            mod.collect_rss,
+            mod.collect_telegram,
+        )
+        try:
+            mod.collect_kev = boom
+            mod.collect_ghsa = boom
+            mod.collect_nvd = lambda *_a, **_k: ([], "NVD failed: offline")
+            mod.collect_rss = boom_rss
+            mod.collect_telegram = boom
+            with tempfile.TemporaryDirectory() as td:
+                argv = ["build_feed.py", "--hours", "1", "--outdir", td, "--no-store"]
+                old = sys.argv
+                sys.argv = argv
+                try:
+                    rc = mod.main()
+                finally:
+                    sys.argv = old
+                self.assertEqual(rc, 1)
+                self.assertFalse(Path(td, "feed.xml").exists())
+        finally:
+            (
+                mod.collect_kev,
+                mod.collect_ghsa,
+                mod.collect_nvd,
+                mod.collect_rss,
+                mod.collect_telegram,
+            ) = orig
 
 
 if __name__ == "__main__":

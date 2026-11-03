@@ -835,6 +835,15 @@ def collect_rss(cutoff: datetime) -> tuple[list[dict], list[str]]:
 
 
 class TelegramHTMLParser(HTMLParser):
+    """Parse t.me/s/... preview HTML into {text, link, date} records.
+
+    Outer message containers use class exactly starting with
+    ``tgme_widget_message `` (space-separated). Nested widgets such as
+    ``tgme_widget_message_bubble`` / ``_text`` must not reset the current
+    message. Finalize only when the outer message div closes, after the
+    footer link and ``<time datetime>`` have been seen.
+    """
+
     def __init__(self):
         super().__init__()
         self.messages: list[dict] = []
@@ -843,17 +852,37 @@ class TelegramHTMLParser(HTMLParser):
         self._cur: dict | None = None
         self._text_parts: list[str] = []
         self._depth_text = 0
+        self._msg_depth = 0
+
+    @staticmethod
+    def _is_outer_message(tag: str, cls: str) -> bool:
+        if tag != "div":
+            return False
+        classes = cls.split()
+        # Exact token match for the outer widget; ignore nested *_bubble / *_text / *_wrapped
+        return "tgme_widget_message" in classes and not any(
+            c.startswith("tgme_widget_message_") for c in classes
+        )
 
     def handle_starttag(self, tag, attrs):
         ad = dict(attrs)
         cls = ad.get("class", "")
-        if tag == "div" and "tgme_widget_message" in cls and "tgme_widget_message_wrapped" not in cls:
-            # start new message bubble
-            self._cur = {"text": "", "link": ad.get("data-post") and f"https://t.me/{ad.get('data-post')}" or "", "date": None}
+        if self._is_outer_message(tag, cls):
+            self._cur = {
+                "text": "",
+                "link": (f"https://t.me/{ad['data-post']}" if ad.get("data-post") else ""),
+                "date": None,
+            }
             self._text_parts = []
+            self._msg_depth = 1
+            self._in_text = False
+            self._depth_text = 0
+            return
         if self._cur is None:
             return
-        if tag == "a" and "tgme_widget_message_date" in cls:
+        if tag == "div":
+            self._msg_depth += 1
+        if tag == "a" and "tgme_widget_message_date" in cls.split():
             href = ad.get("href") or ""
             if href:
                 self._cur["link"] = href
@@ -862,7 +891,7 @@ class TelegramHTMLParser(HTMLParser):
             dt = ad.get("datetime")
             if dt:
                 self._cur["date"] = dt
-        if tag == "div" and "tgme_widget_message_text" in cls:
+        if tag == "div" and "tgme_widget_message_text" in cls.split():
             self._in_text = True
             self._depth_text = 1
             self._text_parts = []
@@ -886,10 +915,15 @@ class TelegramHTMLParser(HTMLParser):
                 self._in_text = False
                 self._cur["text"] = "".join(self._text_parts).strip()
                 self._text_parts = []
-                # finalize when leaving text; date may already be set
+        if tag == "div":
+            self._msg_depth -= 1
+            if self._msg_depth <= 0:
                 if self._cur.get("text") or self._cur.get("link"):
                     self.messages.append(self._cur)
                 self._cur = None
+                self._msg_depth = 0
+                self._in_text = False
+                self._depth_text = 0
 
     def handle_data(self, data):
         if self._in_text and self._cur is not None:
@@ -979,58 +1013,55 @@ def collect_telegram(cutoff: datetime) -> tuple[list[dict], str | None]:
 
 
 def collapse_news_into_cves(items: list[dict]) -> list[dict]:
-    """Merge news/telegram items that clearly cover an existing CVE/GHSA into that record."""
-    by_cve: dict[str, dict] = {}
-    by_ghsa: dict[str, dict] = {}
-    others: list[dict] = []
-    for it in items:
+    """Merge items that share a CVE or GHSA id into one record.
+
+    Advisories that carry both a CVE and a GHSA must still collapse with news
+    that mentions only one of those identifiers. Index every known id, not only
+    each record's preferred dedupe key.
+    """
+    records: list[dict] = []
+    by_cve: dict[str, int] = {}
+    by_ghsa: dict[str, int] = {}
+
+    def _index(idx: int, it: dict) -> None:
+        for c in it.get("cves") or []:
+            by_cve[c.upper()] = idx
+        for g in it.get("ghsa_ids") or []:
+            by_ghsa[g.lower()] = idx
+
+    def _find(it: dict) -> int | None:
+        for c in it.get("cves") or []:
+            if c.upper() in by_cve:
+                return by_cve[c.upper()]
+        for g in it.get("ghsa_ids") or []:
+            if g.lower() in by_ghsa:
+                return by_ghsa[g.lower()]
+        # also honor preferred key when id fields were only on .id
         key = dedupe_key(it)
         if key.startswith("cve:"):
-            k = key
-            if k in by_cve:
-                by_cve[k] = merge_item(by_cve[k], it)
-            else:
-                by_cve[k] = it
-        elif key.startswith("ghsa:"):
-            k = key
-            if k in by_ghsa:
-                by_ghsa[k] = merge_item(by_ghsa[k], it)
-            else:
-                by_ghsa[k] = it
-        else:
-            others.append(it)
+            return by_cve.get(key.split(":", 1)[1].upper())
+        if key.startswith("ghsa:"):
+            return by_ghsa.get(key.split(":", 1)[1].lower())
+        return None
 
-    still_others = []
-    for it in others:
-        cves = it.get("cves") or []
-        ghsas = it.get("ghsa_ids") or []
-        merged = False
-        for c in cves:
-            k = "cve:" + c.upper()
-            if k in by_cve:
-                by_cve[k] = merge_item(by_cve[k], it)
-                merged = True
-                break
-        if merged:
+    url_map: dict[str, int] = {}
+    for it in items:
+        hit = _find(it)
+        if hit is not None:
+            records[hit] = merge_item(records[hit], it)
+            _index(hit, records[hit])
             continue
-        for g in ghsas:
-            k = "ghsa:" + g.lower()
-            if k in by_ghsa:
-                by_ghsa[k] = merge_item(by_ghsa[k], it)
-                merged = True
-                break
-        if not merged:
-            still_others.append(it)
-
-    # dedupe remaining by url/title
-    url_map: dict[str, dict] = {}
-    for it in still_others:
-        k = dedupe_key(it)
-        if k in url_map:
-            url_map[k] = merge_item(url_map[k], it)
-        else:
-            url_map[k] = it
-    return list(by_cve.values()) + list(by_ghsa.values()) + list(url_map.values())
+        key = dedupe_key(it)
+        if key.startswith("url:") or key.startswith("title:"):
+            if key in url_map:
+                idx = url_map[key]
+                records[idx] = merge_item(records[idx], it)
+                _index(idx, records[idx])
+                continue
+            url_map[key] = len(records)
+        records.append(it)
+        _index(len(records) - 1, it)
+    return records
 
 
 def write_feed_xml(path: str, items: list[dict], limit: int = FEED_LIMIT) -> None:
@@ -1280,6 +1311,25 @@ def main() -> int:
         state["last_run"] = iso(end)
         state["lookback_hours"] = args.hours
         save_state(state_path, state)
+    # Refuse to publish an empty replacement when every collector failed.
+    # With --no-store the previous Pages artifact would otherwise be overwritten
+    # by a vacant feed, which drops the live site to zero items.
+    hard_failures = [
+        k
+        for k, v in source_status.items()
+        if isinstance(v, str) and (v.startswith("error") or " failed:" in v or v.startswith("Telegram") and "failed" in v)
+    ]
+    # source_status values look like "ok (...)" / "partial (...)" / "CISA KEV failed: ..." / "ok"
+    all_failed = bool(source_status) and all(
+        (isinstance(v, str) and ("failed" in v.lower() or v.startswith("error")))
+        for v in source_status.values()
+    )
+    if all_failed and not all_items:
+        print("ERROR: every source failed and the item set is empty; not writing feed", flush=True)
+        for k, v in source_status.items():
+            print(f"  {k}: {v}", flush=True)
+        return 1
+
     write_feed_xml(feed_path, all_items, limit=FEED_LIMIT)
     write_index_html(os.path.join(outdir, "index.html"), all_items, limit=FEED_LIMIT)
     write_cname(os.path.join(outdir, "CNAME"))
