@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Fixture Feed</title>
+    <link>https://example.com/</link>
+    <description>Test</description>
+    <item>
+      <title>Critical flaw in popular library CVE-2026-4242</title>
+      <link>https://example.com/articles/cve-2026-4242</link>
+      <pubDate>Mon, 03 Nov 2026 10:00:00 GMT</pubDate>
+      <guid>https://example.com/articles/cve-2026-4242</guid>
+      <description><![CDATA[
+        Researchers describe a remote code execution issue. UNIQUE_LONG_ARTICLE_BODY_PHRASE_DO_NOT_COPY
+        This paragraph is intentionally long and must never appear in the public feed summary.
+        Contact the vendor. No internal hosts named here.
+      ]]></description>
+    </item>
+    <item>
+      <title>Supply-chain attack hits npm maintainers</title>
+      <link>https://example.com/articles/npm-supply</link>
+      <pubDate>Mon, 03 Nov 2026 09:00:00 GMT</pubDate>
+      <description>Short blurb about a malicious package.</description>
+    </item>
+  </channel>
+</rss>
