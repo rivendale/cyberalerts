@@ -238,7 +238,7 @@ def safe_http_url(u: str | None) -> str | None:
 
 
 _XML_CHAR_RE = re.compile(
-    r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]",
+    r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]",
     flags=re.UNICODE,
 )
 
@@ -690,7 +690,7 @@ def collect_nvd(cutoff: datetime, end: datetime) -> tuple[list[dict], str | None
                 # CVSS score
                 score = None
                 metrics = cve_obj.get("metrics") or {}
-                for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
                     arr = metrics.get(key) or []
                     if arr:
                         cvss_data = (arr[0].get("cvssData") or {})
@@ -1073,27 +1073,40 @@ def collapse_news_into_cves(items: list[dict]) -> list[dict]:
         for g in it.get("ghsa_ids") or []:
             by_ghsa[g.lower()] = idx
 
-    def _find(it: dict) -> int | None:
+    def _find_all(it: dict) -> list[int]:
+        hits: list[int] = []
         for c in it.get("cves") or []:
-            if c.upper() in by_cve:
-                return by_cve[c.upper()]
+            i = by_cve.get(c.upper())
+            if i is not None and i not in hits:
+                hits.append(i)
         for g in it.get("ghsa_ids") or []:
-            if g.lower() in by_ghsa:
-                return by_ghsa[g.lower()]
+            i = by_ghsa.get(g.lower())
+            if i is not None and i not in hits:
+                hits.append(i)
         # also honor preferred key when id fields were only on .id
         key = dedupe_key(it)
+        i = None
         if key.startswith("cve:"):
-            return by_cve.get(key.split(":", 1)[1].upper())
-        if key.startswith("ghsa:"):
-            return by_ghsa.get(key.split(":", 1)[1].lower())
-        return None
+            i = by_cve.get(key.split(":", 1)[1].upper())
+        elif key.startswith("ghsa:"):
+            i = by_ghsa.get(key.split(":", 1)[1].lower())
+        if i is not None and i not in hits:
+            hits.append(i)
+        return sorted(hits)
 
     url_map: dict[str, int] = {}
+    dead: set[int] = set()
     for it in items:
-        hit = _find(it)
-        if hit is not None:
-            records[hit] = merge_item(records[hit], it)
-            _index(hit, records[hit])
+        hits = _find_all(it)
+        if hits:
+            # News that names several ids merges into every matching record,
+            # and those records fold into one so an advisory never appears twice.
+            keep = hits[0]
+            records[keep] = merge_item(records[keep], it)
+            for other in hits[1:]:
+                records[keep] = merge_item(records[keep], records[other])
+                dead.add(other)
+            _index(keep, records[keep])
             continue
         key = dedupe_key(it)
         if key.startswith("url:") or key.startswith("title:"):
@@ -1105,7 +1118,7 @@ def collapse_news_into_cves(items: list[dict]) -> list[dict]:
             url_map[key] = len(records)
         records.append(it)
         _index(len(records) - 1, it)
-    return records
+    return [r for i, r in enumerate(records) if i not in dead]
 
 
 
@@ -1260,6 +1273,12 @@ def main() -> int:
     ap.add_argument("--hours", type=float, default=48.0, help="Lookback window in hours")
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="Output directory for feed.xml and index.html")
     ap.add_argument("--no-store", action="store_true", help="Skip store.jsonl persistence (CI/Pages)")
+    ap.add_argument(
+        "--min-items",
+        type=int,
+        default=5,
+        help="When any source failed, refuse to publish fewer items than this (an empty feed is always refused)",
+    )
     args = ap.parse_args()
 
     outdir = args.outdir
@@ -1369,16 +1388,23 @@ def main() -> int:
         state["last_run"] = iso(end)
         state["lookback_hours"] = args.hours
         save_state(state_path, state)
-    # Refuse to publish an empty replacement when every collector failed.
-    # With --no-store the previous Pages artifact would otherwise be overwritten
-    # by a vacant feed, which drops the live site to zero items.
-    # source_status values look like "ok (...)" / "partial (...)" / "CISA KEV failed: ..." / "ok"
-    all_failed = bool(source_status) and all(
-        (isinstance(v, str) and ("failed" in v.lower() or v.startswith("error")))
-        for v in source_status.values()
-    )
-    if all_failed and not all_items:
-        print("ERROR: every source failed and the item set is empty; not writing feed", flush=True)
+    # Refuse to publish a vacant or thin replacement. With --no-store the
+    # previous Pages artifact would otherwise be overwritten, dropping the live
+    # site. An empty feed is always refused; if any source failed or was only
+    # partial, the item count must also reach --min-items.
+    def _source_failed(v: Any) -> bool:
+        if isinstance(v, dict):
+            v = str(v.get("status", "")) + " " + str(v.get("detail", ""))
+        v = str(v).lower()
+        return ("failed" in v) or v.startswith("error") or v.startswith("partial")
+
+    failed = [k for k, v in source_status.items() if _source_failed(v)]
+    if not all_items or (failed and len(all_items) < args.min_items):
+        print(
+            f"ERROR: refusing to write feed: items={len(all_items)} "
+            f"min_items={args.min_items} failed_sources={len(failed)}",
+            flush=True,
+        )
         for k, v in source_status.items():
             print(f"  {k}: {v}", flush=True)
         return 1

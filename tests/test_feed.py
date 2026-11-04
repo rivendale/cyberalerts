@@ -452,5 +452,93 @@ class TestDenyTermsEnv(unittest.TestCase):
         self.assertIn("FEED_DENY_TERMS", Path(__file__).read_text(encoding="utf-8"))
 
 
+def _load_checker():
+    path = ROOT / "check_deny_terms.py"
+    spec = importlib.util.spec_from_file_location("check_deny_terms", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestBuiltSiteDenyCheck(unittest.TestCase):
+    def test_hit_in_built_output_fails(self):
+        chk = _load_checker()
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "feed.xml").write_text("<rss>see FakeSeat here</rss>", encoding="utf-8")
+            Path(td, "index.html").write_text("<p>clean</p>", encoding="utf-8")
+            os.environ["FEED_DENY_TERMS"] = "fakeseat,\r\notherfake"
+            try:
+                buf = io.StringIO()
+                old = sys.stderr
+                sys.stderr = buf
+                try:
+                    rc = chk.main(["x", td, "--require"])
+                finally:
+                    sys.stderr = old
+                self.assertEqual(rc, 1)
+                self.assertNotIn("fakeseat", buf.getvalue().lower())
+                Path(td, "feed.xml").write_text("<rss>clean</rss>", encoding="utf-8")
+                self.assertEqual(chk.main(["x", td, "--require"]), 0)
+            finally:
+                os.environ.pop("FEED_DENY_TERMS", None)
+
+    def test_empty_terms_fail_closed_when_required(self):
+        chk = _load_checker()
+        os.environ.pop("FEED_DENY_TERMS", None)
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(chk.main(["x", td, "--require"]), 1)
+            self.assertEqual(chk.main(["x", td]), 0)
+
+
+class TestPartialFailureGuard(unittest.TestCase):
+    def _run(self, kev_items):
+        import build_feed as mod
+
+        orig = (mod.collect_kev, mod.collect_ghsa, mod.collect_nvd, mod.collect_rss, mod.collect_telegram)
+        try:
+            mod.collect_kev = lambda *_a, **_k: (kev_items, None)
+            mod.collect_ghsa = lambda *_a, **_k: ([], "GitHub Advisories failed: offline")
+            mod.collect_nvd = lambda *_a, **_k: ([], "NVD failed: offline")
+            mod.collect_rss = lambda *_a, **_k: ([], ["RSS x failed: offline"])
+            mod.collect_telegram = lambda *_a, **_k: ([], "Telegram failed: offline")
+            with tempfile.TemporaryDirectory() as td:
+                old = sys.argv
+                sys.argv = ["build_feed.py", "--hours", "1", "--outdir", td, "--no-store"]
+                try:
+                    rc = mod.main()
+                finally:
+                    sys.argv = old
+                return rc, Path(td, "feed.xml").exists()
+        finally:
+            (mod.collect_kev, mod.collect_ghsa, mod.collect_nvd, mod.collect_rss, mod.collect_telegram) = orig
+
+    def test_one_source_ok_but_empty_refuses(self):
+        rc, wrote = self._run([])
+        self.assertEqual(rc, 1)
+        self.assertFalse(wrote)
+
+    def test_partial_failure_below_floor_refuses(self):
+        it = bf.empty_item()
+        it.update({"id": "CVE-2026-0001", "cves": ["CVE-2026-0001"], "title": "t", "published": "2026-11-01T00:00:00Z"})
+        rc, wrote = self._run([it])
+        self.assertEqual(rc, 1)
+        self.assertFalse(wrote)
+
+
+class TestShouldFixes(unittest.TestCase):
+    def test_news_with_two_ids_folds_both_records(self):
+        a = bf.empty_item()
+        a.update({"id": "CVE-2026-1111", "cves": ["CVE-2026-1111"], "title": "a", "severity": "high"})
+        b = bf.empty_item()
+        b.update({"id": "CVE-2026-2222", "cves": ["CVE-2026-2222"], "title": "b", "severity": "critical"})
+        news = bf.empty_item()
+        news.update({"id": "news", "cves": ["CVE-2026-1111", "CVE-2026-2222"], "title": "news"})
+        out = bf.collapse_news_into_cves([a, b, news])
+        self.assertEqual(len(out), 1)
+
+    def test_xml_safe_text_keeps_astral_chars(self):
+        self.assertEqual(bf.xml_safe_text("ok \U0001F512 \U00020000\x01"), "ok \U0001F512 \U00020000")
+
 if __name__ == "__main__":
     unittest.main()
