@@ -216,13 +216,57 @@ def parse_iso(s: str | None) -> datetime | None:
         return None
 
 
+MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB hard cap per response
+
+
+def safe_http_url(u: str | None) -> str | None:
+    """Accept only http(s) URLs. Drop javascript:, data:, and other schemes."""
+    if not u:
+        return None
+    u = str(u).strip()
+    if not u:
+        return None
+    try:
+        p = urllib.parse.urlsplit(u)
+    except ValueError:
+        return None
+    if p.scheme.lower() not in ("http", "https"):
+        return None
+    if not p.netloc:
+        return None
+    return urllib.parse.urlunsplit((p.scheme.lower(), p.netloc, p.path or "/", p.query, ""))
+
+
+_XML_CHAR_RE = re.compile(
+    r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]",
+    flags=re.UNICODE,
+)
+
+
+def xml_safe_text(s: str | None) -> str:
+    """Strip characters outside the XML 1.0 Char production."""
+    if not s:
+        return ""
+    return _XML_CHAR_RE.sub("", str(s))
+
+
 def http_get(url: str, headers: dict | None = None, timeout: int = TIMEOUT) -> bytes:
     h = {"User-Agent": UA, "Accept": "*/*"}
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = resp.read(64 * 1024)
+            if not block:
+                break
+            total += len(block)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"response exceeds {MAX_DOWNLOAD_BYTES} byte cap for {url}")
+            chunks.append(block)
+        return b"".join(chunks)
 
 
 def http_get_json(url: str, headers: dict | None = None) -> Any:
@@ -811,7 +855,7 @@ def collect_rss(cutoff: datetime) -> tuple[list[dict], list[str]]:
                         "id": item_id,
                         "title": title,
                         "sources": [name],
-                        "links": [link] if link else [],
+                        "links": [u] if (u := safe_http_url(link)) else [],
                         "published": iso(pub),
                         "severity": sev,
                         "exploited_in_wild": exploited,
@@ -994,7 +1038,7 @@ def collect_telegram(cutoff: datetime) -> tuple[list[dict], str | None]:
                 "id": item_id,
                 "title": title,
                 "sources": ["Telegram IntCyberDigest"],
-                "links": [link],
+                "links": ([u] if (u := safe_http_url(link)) else []),
                 "published": iso(pub),
                 "severity": "high" if exploited else None,
                 "exploited_in_wild": exploited,
@@ -1064,6 +1108,17 @@ def collapse_news_into_cves(items: list[dict]) -> list[dict]:
     return records
 
 
+
+def sanitize_item_links(items: list[dict]) -> None:
+    """Drop non-http(s) links from each item in place."""
+    for it in items:
+        raw = it.get("links") or []
+        it["links"] = [u for u in (safe_http_url(x) for x in raw) if u]
+        for key in ("title", "summary", "id"):
+            if it.get(key):
+                it[key] = xml_safe_text(it[key])
+
+
 def write_feed_xml(path: str, items: list[dict], limit: int = FEED_LIMIT) -> None:
     # sort by published desc
     def pub_key(it: dict):
@@ -1083,13 +1138,14 @@ def write_feed_xml(path: str, items: list[dict], limit: int = FEED_LIMIT) -> Non
 
     for it in ranked:
         entry = ET.SubElement(channel, "item")
-        title = it.get("title") or it.get("id") or "alert"
+        title = xml_safe_text(it.get("title") or it.get("id") or "alert")
         ET.SubElement(entry, "title").text = title
-        links = it.get("links") or []
+        raw_links = it.get("links") or []
+        links = [u for u in (safe_http_url(x) for x in raw_links) if u]
         if links:
-            ET.SubElement(entry, "link").text = links[0]
+            ET.SubElement(entry, "link").text = xml_safe_text(links[0])
         guid = ET.SubElement(entry, "guid", isPermaLink="false")
-        guid.text = str(it.get("id") or links[0] if links else title)
+        guid.text = xml_safe_text(str(it.get("id") or (links[0] if links else title)))
         pub = parse_iso(it.get("published"))
         if pub:
             ET.SubElement(entry, "pubDate").text = email.utils.format_datetime(pub)
@@ -1109,7 +1165,7 @@ def write_feed_xml(path: str, items: list[dict], limit: int = FEED_LIMIT) -> Non
             bits.append("Unconfirmed claim.")
         if topics:
             bits.append("Topics: " + ", ".join(topics) + ".")
-        ET.SubElement(entry, "description").text = " ".join(bits)
+        ET.SubElement(entry, "description").text = xml_safe_text(" ".join(bits))
         ET.SubElement(entry, "category").text = sev
         for t in topics:
             ET.SubElement(entry, "category").text = t
@@ -1147,9 +1203,10 @@ def write_index_html(path: str, items: list[dict], limit: int = FEED_LIMIT) -> N
     ranked = sorted(items, key=pub_key, reverse=True)[:limit]
     rows = []
     for it in ranked[:20]:
-        title = html.escape(it.get("title") or it.get("id") or "alert")
+        title = html.escape(xml_safe_text(it.get("title") or it.get("id") or "alert"))
         sev = html.escape((it.get("severity") or "unknown").lower())
-        link = html.escape((it.get("links") or ["#"])[0])
+        safe = safe_http_url((it.get("links") or [None])[0])
+        link = html.escape(safe) if safe else "#"
         rows.append(
             f'<li><span class="sev {sev}">{sev}</span> <a href="{link}">{title}</a></li>'
         )
@@ -1159,6 +1216,7 @@ def write_index_html(path: str, items: list[dict], limit: int = FEED_LIMIT) -> N
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
 <title>Pennview Labs Cyber Alerts</title>
 <meta name="description" content="Public vulnerability and threat RSS feed from Pennview Labs.">
 <link rel="alternate" type="application/rss+xml" title="Pennview Labs Cyber Alerts" href="/feed.xml">
@@ -1314,11 +1372,6 @@ def main() -> int:
     # Refuse to publish an empty replacement when every collector failed.
     # With --no-store the previous Pages artifact would otherwise be overwritten
     # by a vacant feed, which drops the live site to zero items.
-    hard_failures = [
-        k
-        for k, v in source_status.items()
-        if isinstance(v, str) and (v.startswith("error") or " failed:" in v or v.startswith("Telegram") and "failed" in v)
-    ]
     # source_status values look like "ok (...)" / "partial (...)" / "CISA KEV failed: ..." / "ok"
     all_failed = bool(source_status) and all(
         (isinstance(v, str) and ("failed" in v.lower() or v.startswith("error")))
@@ -1330,6 +1383,7 @@ def main() -> int:
             print(f"  {k}: {v}", flush=True)
         return 1
 
+    sanitize_item_links(all_items)
     write_feed_xml(feed_path, all_items, limit=FEED_LIMIT)
     write_index_html(os.path.join(outdir, "index.html"), all_items, limit=FEED_LIMIT)
     write_cname(os.path.join(outdir, "CNAME"))

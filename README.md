@@ -34,7 +34,7 @@ Deduping: CVE id, else GHSA id, else normalized URL. News that mentions an exist
 
 ## Schedule
 
-GitHub Actions runs tests, builds the feed, and deploys to **GitHub Pages** about every two hours (`cron: 17 */2 * * *`), plus `workflow_dispatch`.
+GitHub Actions runs tests, builds the feed, and deploys to **GitHub Pages** about every two hours. Deploy runs only from `main`. Set repository secret `FEED_DENY_TERMS` (comma/newline deny terms for leak checks; never echo) before the first main deploy — empty fails closed. (`cron: 17 */2 * * *`), plus `workflow_dispatch`.
 
 ## Local use
 

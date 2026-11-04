@@ -30,23 +30,32 @@ def load_builder():
 
 bf = load_builder()
 
-def _private_host_re():
-    # Fragments joined at runtime; keep private estate names out of source text.
+def _private_host_re(extra_terms: list[str] | None = None):
+    """Public-safe patterns only in source. Estate/seat names come from FEED_DENY_TERMS env (CI secret)."""
     parts = [
         r"localhost",
         r"127\.0\.0\.1",
         r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}",
         r"192\.168\.\d{1,3}\.\d{1,3}",
         r"172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}",
-        "home" + "lab",
-        "nick" + "-laptop",
-        "ry" + "giel",
-        "protocol" + "[ -]?" + "wealth",
     ]
+    for term in extra_terms or []:
+        term = (term or "").strip()
+        if term:
+            parts.append(re.escape(term))
     return re.compile(r"(?i)\b(" + "|".join(parts) + r")\b")
 
 
-PRIVATE_HOST_RE = _private_host_re()
+def _deny_terms_from_env() -> list[str]:
+    raw = os.environ.get("FEED_DENY_TERMS") or os.environ.get("HYGIENE_DENY_TERMS") or ""
+    # comma or newline separated; never print
+    bits = []
+    for chunk in raw.replace("\n", "\n").splitlines():
+        bits.extend(p.strip() for p in chunk.split(","))
+    return [b for b in bits if b]
+
+
+PRIVATE_HOST_RE = _private_host_re(_deny_terms_from_env())
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
 
@@ -342,6 +351,105 @@ class TestEmptyFeedGuard(unittest.TestCase):
                 mod.collect_rss,
                 mod.collect_telegram,
             ) = orig
+
+
+
+
+class TestLinkSchemeGuard(unittest.TestCase):
+    def test_javascript_link_dropped_from_html_and_rss(self):
+        it = bf.empty_item()
+        it.update(
+            {
+                "id": "hostile-1",
+                "title": "Hostile link item",
+                "links": ["javascript:alert(document.domain)"],
+                "summary": "templated",
+                "severity": "high",
+                "published": "2026-11-03T10:00:00Z",
+                "first_seen": "2026-11-03T10:00:00Z",
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            feed = os.path.join(td, "feed.xml")
+            index = os.path.join(td, "index.html")
+            bf.sanitize_item_links([it])
+            bf.write_feed_xml(feed, [it])
+            bf.write_index_html(index, [it])
+            html_blob = Path(index).read_text(encoding="utf-8")
+            rss_blob = Path(feed).read_text(encoding="utf-8")
+            self.assertNotIn("javascript:", html_blob.lower())
+            self.assertNotIn("javascript:", rss_blob.lower())
+            self.assertIn('href="#"', html_blob)
+            self.assertIn('Content-Security-Policy', html_blob)
+
+    def test_safe_http_url_accepts_only_http_https(self):
+        self.assertEqual(bf.safe_http_url("https://example.com/a"), "https://example.com/a")
+        self.assertIsNone(bf.safe_http_url("javascript:alert(1)"))
+        self.assertIsNone(bf.safe_http_url("data:text/html,hi"))
+        self.assertIsNone(bf.safe_http_url("/relative"))
+
+
+class TestXmlSafeText(unittest.TestCase):
+    def test_control_char_stripped_so_feed_still_parses(self):
+        it = bf.empty_item()
+        dirty = "NVD note with \x01 control and \x07 bell"
+        it.update(
+            {
+                "id": "CVE-2026-0001",
+                "title": dirty,
+                "links": ["https://nvd.nist.gov/vuln/detail/CVE-2026-0001"],
+                "summary": dirty,
+                "severity": "medium",
+                "published": "2026-11-03T10:00:00Z",
+                "first_seen": "2026-11-03T10:00:00Z",
+                "cves": ["CVE-2026-0001"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            feed = os.path.join(td, "feed.xml")
+            bf.sanitize_item_links([it])
+            bf.write_feed_xml(feed, [it])
+            # must parse as XML
+            import xml.etree.ElementTree as ET
+            ET.parse(feed)
+            blob = Path(feed).read_text(encoding="utf-8")
+            self.assertNotIn("\x01", blob)
+            self.assertNotIn("\x07", blob)
+
+
+class TestGuidPrecedence(unittest.TestCase):
+    def test_id_used_when_links_empty(self):
+        it = bf.empty_item()
+        it.update(
+            {
+                "id": "CVE-2026-4242",
+                "title": "Has id no links",
+                "links": [],
+                "summary": "x",
+                "severity": "low",
+                "published": "2026-11-03T10:00:00Z",
+                "first_seen": "2026-11-03T10:00:00Z",
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            feed = os.path.join(td, "feed.xml")
+            bf.write_feed_xml(feed, [it])
+            blob = Path(feed).read_text(encoding="utf-8")
+            self.assertIn("<guid", blob)
+            self.assertIn("CVE-2026-4242", blob)
+
+
+class TestDenyTermsEnv(unittest.TestCase):
+    def test_env_terms_extend_leak_guard_without_names_in_source(self):
+        # Fake terms only — real estate names must not appear in this file.
+        os.environ["FEED_DENY_TERMS"] = "fakeseat,otherfake"
+        try:
+            pat = _private_host_re(_deny_terms_from_env())
+            self.assertIsNotNone(pat.search("see fakeseat here"))
+            self.assertIsNone(pat.search("innocent text"))
+        finally:
+            os.environ.pop("FEED_DENY_TERMS", None)
+        self.assertIn("FEED_DENY_TERMS", Path(__file__).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
