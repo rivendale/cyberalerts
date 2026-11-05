@@ -765,9 +765,12 @@ class RSSParser:
             return tag.split("}")[-1] if "}" in tag else tag
 
         root_l = local(root.tag).lower()
-        # RSS 2.0
-        channels = [c for c in root.iter() if local(c.tag).lower() == "channel"]
-        if channels or root_l == "rss":
+        # RSS 2.0 only when the root is <rss>. RSS 1.0 / RDF only when the
+        # root is <rdf> (rdf:RDF) and a <channel> is present. A <channel>
+        # nested inside HTML or any other document is not a feed: taking that
+        # branch used to return zero items and zero errors.
+        has_channel = any(local(c.tag).lower() == "channel" for c in root.iter())
+        if root_l == "rss" or (root_l == "rdf" and has_channel):
             for it in root.iter():
                 if local(it.tag).lower() != "item":
                     continue
@@ -789,8 +792,8 @@ class RSSParser:
                     {"title": title, "link": link or guid, "description": desc, "published": pub}
                 )
             return items
-        # Atom: require a feed root. An HTML 200 (or other non-feed document)
-        # must not quietly become an empty item list with zero errors.
+        # Atom only when the root is <feed>. Every other root is an error so
+        # a non-feed HTTP 200 cannot look like a healthy empty source.
         if root_l != "feed":
             raise ValueError(f"unsupported feed document root <{root_l}>")
         for it in root.iter():
@@ -976,6 +979,37 @@ class TelegramHTMLParser(HTMLParser):
             self._text_parts.append(data)
 
 
+def _public_telegram_title(text: str, cves: list[str], ghsas: list[str]) -> str:
+    """Short title that does not republish a Telegram post.
+
+    When the first line is most of the post, an eight-word slice still keeps
+    every word of a short post (and the summary then repeats it). Posts of
+    eight words or fewer are replaced with ``Telegram signal: CVE-…`` when an
+    id is present, otherwise at most half the words. Longer posts stay capped
+    at eight words.
+    """
+    flat = re.sub(r"\s+", " ", text or "").strip()
+    first = re.sub(r"\s+", " ", (text or "").split("\n")[0]).strip()[:160]
+    if not flat or len(first) < 0.6 * len(flat):
+        return first
+    words = flat.split()
+    ident = cves[0] if cves else (ghsas[0] if ghsas else "")
+    if len(words) <= 8 and ident:
+        title = f"Telegram signal: {ident}"
+    elif len(words) <= 8:
+        keep = len(words) // 2
+        title = (" ".join(words[:keep]) + "\u2026") if keep else "Telegram signal"
+    else:
+        title = " ".join(words[:8]) + "\u2026"
+    # The whole post must not survive inside the title (a one-word post, or a
+    # post that is only the id, would otherwise).
+    if flat.casefold() in title.casefold():
+        title = "Telegram signal"
+        if flat.casefold() in title.casefold():
+            title = "\u2026"
+    return title[:160]
+
+
 def collect_telegram(cutoff: datetime) -> tuple[list[dict], str | None]:
     url = "https://t.me/s/IntCyberDigest"
     try:
@@ -1015,17 +1049,10 @@ def collect_telegram(cutoff: datetime) -> tuple[list[dict], str | None]:
         text = strip_html(m.get("text") or "")
         if not text:
             continue
-        # NEVER store wholesale post; derive short title + templated summary only
-        title = text.split("\n")[0][:160]
-        title = re.sub(r"\s+", " ", title).strip()
-        # A short post's first line can be the whole post; shorten it so the
-        # feed never republishes a Telegram post in full. Cap even when the
-        # first line is <= 8 words.
-        flat = re.sub(r"\s+", " ", text).strip()
-        words = title.split()
-        if flat and len(title) >= 0.6 * len(flat):
-            title = " ".join(words[:8]) + "\u2026"
+        # NEVER store the post wholesale. Ids are extracted first so a short
+        # post can be titled from the CVE/GHSA instead of its own words.
         cves, ghsas = extract_ids(text)
+        title = _public_telegram_title(text, cves, ghsas)
         topics = detect_topics(text)
         exploited = bool(
             re.search(r"exploited in the wild|actively exploited|active exploit", text, re.I)

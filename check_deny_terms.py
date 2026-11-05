@@ -5,7 +5,9 @@ Usage: python check_deny_terms.py <site-dir> [--require]
 
 Terms come from the FEED_DENY_TERMS env var (comma or newline separated) and
 are matched case-insensitively as plain substrings, against both the raw
-and the HTML-unescaped text. Terms are never printed:
+and the HTML-unescaped text. Each term is whitespace-collapsed the same way
+as the page text (spaces, tabs, and non-breaking spaces) before matching.
+Terms are never printed:
 a hit reports only the file name and how many terms matched. With --require,
 an empty or unset FEED_DENY_TERMS also fails (fail closed on main).
 """
@@ -19,13 +21,20 @@ import sys
 from pathlib import Path
 
 
+def collapse_ws(text: str) -> str:
+    """Collapse Unicode whitespace, including NBSP, to a single space."""
+    return re.sub(r"[\s\u00a0]+", " ", text).strip()
+
+
 def load_terms(raw: str | None) -> list[str]:
     terms: list[str] = []
     for line in (raw or "").replace("\r", "\n").split("\n"):
         for part in line.split(","):
-            part = part.strip()
+            # Collapse the configured term itself. "fake  seat" and
+            # "fake\u00a0seat" must hit the same page text as "fake seat".
+            part = collapse_ws(part.lower())
             if part:
-                terms.append(part.lower())
+                terms.append(part)
     return terms
 
 
@@ -38,9 +47,9 @@ def _text_forms(raw: str) -> list[str]:
     for f in forms:
         low = f.lower()
         out.append(low)
-        # Collapse any Unicode whitespace (including NBSP) so "fake\u00a0seat"
-        # still matches deny term "fake seat".
-        collapsed = re.sub(r"[\s\u00a0]+", " ", low)
+        # Same collapse as load_terms, so a term and the page text compare
+        # after identical whitespace normalization.
+        collapsed = collapse_ws(low)
         if collapsed not in out:
             out.append(collapsed)
     return out

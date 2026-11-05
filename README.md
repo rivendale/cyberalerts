@@ -36,6 +36,8 @@ Deduping: CVE id, else GHSA id, else normalized URL. News that mentions an exist
 
 GitHub Actions runs tests, builds the feed, and deploys to **GitHub Pages** about every two hours. Deploy runs only from `main`. Set repository secret `FEED_DENY_TERMS` (comma/newline deny terms for leak checks; never echo) before the first main deploy — empty fails closed. (`cron: 17 */2 * * *`), plus `workflow_dispatch`.
 
+The deny-term check collapses whitespace in each configured term the same way it collapses the built page (runs of spaces, tabs, and non-breaking spaces become one space) and matches that against the raw and HTML-unescaped text. Item titles and descriptions are XML character data: the builder does not emit nested markup inside item text, and RSS and Telegram HTML is tag-stripped before it is stored. The checker does not strip tags a second time.
+
 ## Local use
 
 ```bash

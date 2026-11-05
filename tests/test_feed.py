@@ -559,6 +559,30 @@ class TestRound2Fixes(unittest.TestCase):
                 finally:
                     os.environ.pop("FEED_DENY_TERMS", None)
 
+    def test_configured_deny_term_whitespace_collapsed(self):
+        """A term with a double space or NBSP must hit the same page text as the collapsed form."""
+        chk = _load_checker()
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "feed.xml").write_text("<rss>fake seat lives here</rss>", encoding="utf-8")
+            for term in ("fake  seat", "fake\u00a0seat", "fake\tseat"):
+                os.environ["FEED_DENY_TERMS"] = term
+                try:
+                    old = sys.stderr
+                    sys.stderr = io.StringIO()
+                    try:
+                        self.assertEqual(chk.main(["x", td, "--require"]), 1, repr(term))
+                    finally:
+                        sys.stderr = old
+                finally:
+                    os.environ.pop("FEED_DENY_TERMS", None)
+            os.environ["FEED_DENY_TERMS"] = "fake  seat"
+            try:
+                self.assertEqual(chk.load_terms(os.environ["FEED_DENY_TERMS"]), ["fake seat"])
+                Path(td, "feed.xml").write_text("<rss>fakeseat is one word</rss>", encoding="utf-8")
+                self.assertEqual(chk.main(["x", td, "--require"]), 0)
+            finally:
+                os.environ.pop("FEED_DENY_TERMS", None)
+
     def test_nbsp_collapsed_deny_term_still_caught(self):
         chk = _load_checker()
         with tempfile.TemporaryDirectory() as td:
@@ -605,27 +629,128 @@ class TestRound2Fixes(unittest.TestCase):
         self.assertTrue(all("failed" in e for e in errors))
         self.assertTrue(any("unsupported feed document root" in e for e in errors))
 
-    def test_short_telegram_title_always_capped(self):
-        """Whole short posts (<=8 words) still get an ellipsis title cap."""
-        html = (
-            '<div class="tgme_widget_message" data-post="IntCyberDigest/1">'
-            '<div class="tgme_widget_message_date"><time datetime="2026-11-05T12:00:00+00:00"></time></div>'
-            '<div class="tgme_widget_message_text">Short alert about CVE-2026-9999</div>'
-            '<a class="tgme_widget_message_date" href="https://t.me/IntCyberDigest/1"></a>'
-            "</div>"
-        )
-        cutoff = bf.parse_iso("2026-11-01T00:00:00Z")
+    def test_html_with_nested_channel_fails_source(self):
+        """A non-feed document that merely contains <channel> is not a healthy empty source."""
+        html = b"<html><body><channel>unavailable</channel></body></html>"
+        with self.assertRaises(ValueError) as ctx:
+            bf.RSSParser.parse(html)
+        self.assertIn("unsupported feed document root", str(ctx.exception))
+        self.assertIn("<html>", str(ctx.exception))
+
+        # A real RSS 2.0 feed, an RDF feed with a channel, and an Atom feed still parse.
+        rss_entries = bf.RSSParser.parse((FIX / "sample_rss.xml").read_bytes())
+        self.assertGreaterEqual(len(rss_entries), 1)
+        self.assertIn("CVE-2026-4242", rss_entries[0]["title"])
+        rdf = b"""<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/">
+  <channel><title>RDF</title><link>https://example.com/</link></channel>
+  <item><title>RDF item title</title><link>https://example.com/rdf</link></item>
+</rdf:RDF>"""
+        rdf_entries = bf.RSSParser.parse(rdf)
+        self.assertEqual(len(rdf_entries), 1)
+        self.assertEqual(rdf_entries[0]["title"], "RDF item title")
+        atom = b"""<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Atom</title>
+  <entry>
+    <title>Atom item title</title>
+    <link href="https://example.com/atom"/>
+    <updated>2026-11-03T10:00:00Z</updated>
+  </entry>
+</feed>"""
+        atom_entries = bf.RSSParser.parse(atom)
+        self.assertEqual(len(atom_entries), 1)
+        self.assertEqual(atom_entries[0]["title"], "Atom item title")
+
         orig = bf.http_get
         try:
-            bf.http_get = lambda *_a, **_k: html.encode("utf-8")
-            items, err = bf.collect_telegram(cutoff)
+            bf.http_get = lambda *_a, **_k: html
+            items, errors = bf.collect_rss(bf.now_utc())
         finally:
             bf.http_get = orig
-        self.assertIsNone(err)
-        self.assertEqual(len(items), 1)
-        title = items[0]["title"]
-        self.assertTrue(title.endswith("\u2026"), title)
-        self.assertIn("CVE-2026-9999", items[0]["cves"] or [items[0]["id"]])
+        self.assertEqual(items, [])
+        self.assertGreater(len(errors), 0)
+        self.assertEqual(len(errors), len(bf.RSS_FEEDS))
+        self.assertTrue(all("failed" in e for e in errors))
+
+        import build_feed as mod
+
+        saved = (
+            mod.collect_kev,
+            mod.collect_ghsa,
+            mod.collect_nvd,
+            mod.collect_telegram,
+            mod.http_get,
+        )
+        try:
+            mod.collect_kev = lambda *_a, **_k: ([], None)
+            mod.collect_ghsa = lambda *_a, **_k: ([], None)
+            mod.collect_nvd = lambda *_a, **_k: ([], None)
+            mod.collect_telegram = lambda *_a, **_k: ([], None)
+            mod.http_get = lambda *_a, **_k: html
+            with tempfile.TemporaryDirectory() as td:
+                old = sys.argv
+                sys.argv = ["build_feed.py", "--hours", "1", "--outdir", td, "--no-store"]
+                try:
+                    rc = mod.main()
+                finally:
+                    sys.argv = old
+                self.assertNotEqual(rc, 0)
+                self.assertFalse(Path(td, "feed.xml").exists())
+        finally:
+            (
+                mod.collect_kev,
+                mod.collect_ghsa,
+                mod.collect_nvd,
+                mod.collect_telegram,
+                mod.http_get,
+            ) = saved
+
+    def test_short_telegram_title_does_not_repeat_post(self):
+        """A short post must not be published whole in the title or the summary.
+
+        Ending with an ellipsis is not enough: eight words or fewer used to
+        survive as words[:8] plus an ellipsis, which still contains the post.
+        """
+        cutoff = bf.parse_iso("2026-11-01T00:00:00Z")
+
+        def _collect(post: str) -> dict:
+            html = (
+                '<div class="tgme_widget_message" data-post="IntCyberDigest/1">'
+                '<div class="tgme_widget_message_date">'
+                '<time datetime="2026-11-05T12:00:00+00:00"></time></div>'
+                f'<div class="tgme_widget_message_text">{post}</div>'
+                '<a class="tgme_widget_message_date" href="https://t.me/IntCyberDigest/1"></a>'
+                "</div>"
+            )
+            orig = bf.http_get
+            try:
+                bf.http_get = lambda *_a, **_k: html.encode("utf-8")
+                items, err = bf.collect_telegram(cutoff)
+            finally:
+                bf.http_get = orig
+            self.assertIsNone(err)
+            self.assertEqual(len(items), 1, post)
+            return items[0]
+
+        post = "Short alert about CVE-2026-9999"
+        item = _collect(post)
+        self.assertNotIn(post, item["title"])
+        self.assertNotIn(post, item["summary"])
+        self.assertNotEqual(item["title"], post + "\u2026")
+        self.assertTrue(item["title"].startswith("Telegram signal:"))
+        self.assertIn("CVE-2026-9999", item["title"])
+        self.assertIn("CVE-2026-9999", item["cves"] or [item["id"]])
+
+        # Eight words, no id: half the words, not the whole post plus an ellipsis.
+        eight = "Patch the supply chain hole immediately today now"
+        self.assertEqual(len(eight.split()), 8)
+        item = _collect(eight)
+        self.assertNotIn(eight, item["title"])
+        self.assertNotIn(eight, item["summary"])
+        self.assertNotEqual(item["title"], eight + "\u2026")
+        self.assertLessEqual(len(item["title"].replace("\u2026", "").split()), len(eight.split()) // 2)
+        self.assertTrue(item["title"].endswith("\u2026"))
 
 
 if __name__ == "__main__":
