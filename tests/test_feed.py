@@ -542,3 +542,36 @@ class TestShouldFixes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRound2Fixes(unittest.TestCase):
+    def test_escaped_deny_term_still_caught(self):
+        chk = _load_checker()
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "feed.xml").write_text(
+                "<rss>Fake &amp; Seat and Bob&#39;s Box and A&amp;amp;B</rss>", encoding="utf-8"
+            )
+            for term in ("fake & seat", "bob's box", "a&b"):
+                os.environ["FEED_DENY_TERMS"] = term
+                try:
+                    old = sys.stderr
+                    sys.stderr = io.StringIO()
+                    try:
+                        self.assertEqual(chk.main(["x", td, "--require"]), 1, term)
+                    finally:
+                        sys.stderr = old
+                finally:
+                    os.environ.pop("FEED_DENY_TERMS", None)
+
+    def test_rss_parse_error_fails_source(self):
+        with self.assertRaises(ET.ParseError):
+            bf.RSSParser.parse(b"<rss><channel><item>broken")
+        orig = bf.http_get
+        try:
+            bf.http_get = lambda *_a, **_k: b"<not xml"
+            items, errors = bf.collect_rss(bf.now_utc())
+        finally:
+            bf.http_get = orig
+        self.assertEqual(items, [])
+        self.assertEqual(len(errors), len(bf.RSS_FEEDS))
+        self.assertTrue(all("failed" in e for e in errors))

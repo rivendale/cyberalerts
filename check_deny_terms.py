@@ -4,13 +4,15 @@
 Usage: python check_deny_terms.py <site-dir> [--require]
 
 Terms come from the FEED_DENY_TERMS env var (comma or newline separated) and
-are matched case-insensitively as plain substrings. Terms are never printed:
+are matched case-insensitively as plain substrings, against both the raw
+and the HTML-unescaped text. Terms are never printed:
 a hit reports only the file name and how many terms matched. With --require,
 an empty or unset FEED_DENY_TERMS also fails (fail closed on main).
 """
 
 from __future__ import annotations
 
+import html
 import os
 import sys
 from pathlib import Path
@@ -29,8 +31,13 @@ def load_terms(raw: str | None) -> list[str]:
 def scan(site: Path, terms: list[str]) -> list[tuple[str, int]]:
     hits: list[tuple[str, int]] = []
     for path in sorted(p for p in site.rglob("*") if p.is_file()):
-        text = path.read_bytes().decode("utf-8", errors="replace").lower()
-        n = sum(1 for t in terms if t in text)
+        raw = path.read_bytes().decode("utf-8", errors="replace")
+        # Match the raw text and its HTML/XML-unescaped form, so a term with
+        # & or an apostrophe can't slip past once escaped (twice, to catch
+        # double-escaped feed text such as &amp;amp;).
+        once = html.unescape(raw)
+        forms = [raw.lower(), once.lower(), html.unescape(once).lower()]
+        n = sum(1 for t in terms if any(t in f for f in forms))
         if n:
             hits.append((str(path.relative_to(site)), n))
     return hits

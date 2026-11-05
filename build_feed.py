@@ -757,10 +757,9 @@ class RSSParser:
     @staticmethod
     def parse(content: bytes) -> list[dict]:
         items = []
-        try:
-            root = ET.fromstring(content)
-        except ET.ParseError:
-            return items
+        # A ParseError propagates: collect_rss records the source as failed,
+        # so the --min-items floor applies instead of a silent empty list.
+        root = ET.fromstring(content)
         # strip namespaces for simplicity
         def local(tag: str) -> str:
             return tag.split("}")[-1] if "}" in tag else tag
@@ -1016,6 +1015,12 @@ def collect_telegram(cutoff: datetime) -> tuple[list[dict], str | None]:
         # NEVER store wholesale post; derive short title + templated summary only
         title = text.split("\n")[0][:160]
         title = re.sub(r"\s+", " ", title).strip()
+        # A short post's first line can be the whole post; shorten it so the
+        # feed never republishes a Telegram post in full.
+        flat = re.sub(r"\s+", " ", text).strip()
+        words = title.split()
+        if len(title) >= 0.6 * len(flat) and len(words) > 8:
+            title = " ".join(words[:8]) + "\u2026"
         cves, ghsas = extract_ids(text)
         topics = detect_topics(text)
         exploited = bool(
