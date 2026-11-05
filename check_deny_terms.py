@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -28,15 +29,32 @@ def load_terms(raw: str | None) -> list[str]:
     return terms
 
 
+def _text_forms(raw: str) -> list[str]:
+    """Raw, HTML-unescaped, and whitespace-collapsed forms (incl. U+00A0)."""
+    once = html.unescape(raw)
+    twice = html.unescape(once)
+    forms = [raw, once, twice]
+    out: list[str] = []
+    for f in forms:
+        low = f.lower()
+        out.append(low)
+        # Collapse any Unicode whitespace (including NBSP) so "fake\u00a0seat"
+        # still matches deny term "fake seat".
+        collapsed = re.sub(r"[\s\u00a0]+", " ", low)
+        if collapsed not in out:
+            out.append(collapsed)
+    return out
+
+
 def scan(site: Path, terms: list[str]) -> list[tuple[str, int]]:
     hits: list[tuple[str, int]] = []
     for path in sorted(p for p in site.rglob("*") if p.is_file()):
         raw = path.read_bytes().decode("utf-8", errors="replace")
         # Match the raw text and its HTML/XML-unescaped form, so a term with
         # & or an apostrophe can't slip past once escaped (twice, to catch
-        # double-escaped feed text such as &amp;amp;).
-        once = html.unescape(raw)
-        forms = [raw.lower(), once.lower(), html.unescape(once).lower()]
+        # double-escaped feed text such as &amp;amp;). Also collapse
+        # whitespace including U+00A0 so NBSP-separated terms still hit.
+        forms = _text_forms(raw)
         n = sum(1 for t in terms if any(t in f for f in forms))
         if n:
             hits.append((str(path.relative_to(site)), n))

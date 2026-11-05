@@ -540,10 +540,6 @@ class TestShouldFixes(unittest.TestCase):
     def test_xml_safe_text_keeps_astral_chars(self):
         self.assertEqual(bf.xml_safe_text("ok \U0001F512 \U00020000\x01"), "ok \U0001F512 \U00020000")
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestRound2Fixes(unittest.TestCase):
     def test_escaped_deny_term_still_caught(self):
         chk = _load_checker()
@@ -563,6 +559,23 @@ class TestRound2Fixes(unittest.TestCase):
                 finally:
                     os.environ.pop("FEED_DENY_TERMS", None)
 
+    def test_nbsp_collapsed_deny_term_still_caught(self):
+        chk = _load_checker()
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "feed.xml").write_text(
+                "<rss>fake\u00a0seat lives here</rss>", encoding="utf-8"
+            )
+            os.environ["FEED_DENY_TERMS"] = "fake seat"
+            try:
+                old = sys.stderr
+                sys.stderr = io.StringIO()
+                try:
+                    self.assertEqual(chk.main(["x", td, "--require"]), 1)
+                finally:
+                    sys.stderr = old
+            finally:
+                os.environ.pop("FEED_DENY_TERMS", None)
+
     def test_rss_parse_error_fails_source(self):
         with self.assertRaises(ET.ParseError):
             bf.RSSParser.parse(b"<rss><channel><item>broken")
@@ -575,3 +588,45 @@ class TestRound2Fixes(unittest.TestCase):
         self.assertEqual(items, [])
         self.assertEqual(len(errors), len(bf.RSS_FEEDS))
         self.assertTrue(all("failed" in e for e in errors))
+
+    def test_html_document_root_fails_source(self):
+        """An HTML 200 must not become an empty item list with zero errors."""
+        html = b"<!DOCTYPE html><html><head><title>x</title></head><body>no feed</body></html>"
+        with self.assertRaises(ValueError):
+            bf.RSSParser.parse(html)
+        orig = bf.http_get
+        try:
+            bf.http_get = lambda *_a, **_k: html
+            items, errors = bf.collect_rss(bf.now_utc())
+        finally:
+            bf.http_get = orig
+        self.assertEqual(items, [])
+        self.assertEqual(len(errors), len(bf.RSS_FEEDS))
+        self.assertTrue(all("failed" in e for e in errors))
+        self.assertTrue(any("unsupported feed document root" in e for e in errors))
+
+    def test_short_telegram_title_always_capped(self):
+        """Whole short posts (<=8 words) still get an ellipsis title cap."""
+        html = (
+            '<div class="tgme_widget_message" data-post="IntCyberDigest/1">'
+            '<div class="tgme_widget_message_date"><time datetime="2026-11-05T12:00:00+00:00"></time></div>'
+            '<div class="tgme_widget_message_text">Short alert about CVE-2026-9999</div>'
+            '<a class="tgme_widget_message_date" href="https://t.me/IntCyberDigest/1"></a>'
+            "</div>"
+        )
+        cutoff = bf.parse_iso("2026-11-01T00:00:00Z")
+        orig = bf.http_get
+        try:
+            bf.http_get = lambda *_a, **_k: html.encode("utf-8")
+            items, err = bf.collect_telegram(cutoff)
+        finally:
+            bf.http_get = orig
+        self.assertIsNone(err)
+        self.assertEqual(len(items), 1)
+        title = items[0]["title"]
+        self.assertTrue(title.endswith("\u2026"), title)
+        self.assertIn("CVE-2026-9999", items[0]["cves"] or [items[0]["id"]])
+
+
+if __name__ == "__main__":
+    unittest.main()

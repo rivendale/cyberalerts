@@ -789,7 +789,10 @@ class RSSParser:
                     {"title": title, "link": link or guid, "description": desc, "published": pub}
                 )
             return items
-        # Atom
+        # Atom: require a feed root. An HTML 200 (or other non-feed document)
+        # must not quietly become an empty item list with zero errors.
+        if root_l != "feed":
+            raise ValueError(f"unsupported feed document root <{root_l}>")
         for it in root.iter():
             if local(it.tag).lower() != "entry":
                 continue
@@ -1016,10 +1019,11 @@ def collect_telegram(cutoff: datetime) -> tuple[list[dict], str | None]:
         title = text.split("\n")[0][:160]
         title = re.sub(r"\s+", " ", title).strip()
         # A short post's first line can be the whole post; shorten it so the
-        # feed never republishes a Telegram post in full.
+        # feed never republishes a Telegram post in full. Cap even when the
+        # first line is <= 8 words.
         flat = re.sub(r"\s+", " ", text).strip()
         words = title.split()
-        if len(title) >= 0.6 * len(flat) and len(words) > 8:
+        if flat and len(title) >= 0.6 * len(flat):
             title = " ".join(words[:8]) + "\u2026"
         cves, ghsas = extract_ids(text)
         topics = detect_topics(text)
