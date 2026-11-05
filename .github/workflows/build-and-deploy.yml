@@ -1,0 +1,91 @@
+name: Build and deploy feed
+
+on:
+  schedule:
+    # Every 2 hours
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+
+# Default: no permissions; deploy job elevates only what Pages needs
+permissions: {}
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+
+  build:
+    name: Build feed
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Require FEED_DENY_TERMS on main deploys
+        if: github.ref == 'refs/heads/main'
+        env:
+          FEED_DENY_TERMS: ${{ secrets.FEED_DENY_TERMS }}
+        run: |
+          if [ -z "$FEED_DENY_TERMS" ]; then
+            echo "::error::FEED_DENY_TERMS repository secret is empty; refusing main deploy (fail closed). Nick must set it (comma/newline terms; never echo)."
+            exit 1
+          fi
+          echo "FEED_DENY_TERMS is set (value not printed)."
+      - name: Build public feed
+        env:
+          # Optional: raises GitHub Advisories rate limits when Actions token is present
+          GITHUB_TOKEN: ${{ github.token }}
+          FEED_DENY_TERMS: ${{ secrets.FEED_DENY_TERMS }}
+        run: python build_feed.py --hours 72 --outdir site --no-store
+      - name: Check built site against FEED_DENY_TERMS
+        env:
+          FEED_DENY_TERMS: ${{ secrets.FEED_DENY_TERMS }}
+          REQUIRE_FLAG: ${{ github.ref == 'refs/heads/main' && '--require' || '' }}
+        run: python check_deny_terms.py site $REQUIRE_FLAG
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    # Permanent deploys only from main (scheduled runs and manual dispatch on main).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
